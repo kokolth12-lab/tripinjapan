@@ -439,7 +439,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
         // --- 全域變數宣告 ---
         const RATE_HKD = 0.051;
@@ -455,59 +455,50 @@
         let pendingRestImg = "";
         let calcInput = "0"; let calcBuffer = 0; let calcPendingOp = null; let calcJustSolved = false; let calcFormula = "";
         
-        // --- FIREBASE 初始化 (使用您的設定) ---
-        const firebaseConfig = {
-          apiKey: "AIzaSyCMPSoMyRLnE4MBOJTG4A5Yn1Gc3ILQXKM",
-          authDomain: "trip-4c948.firebaseapp.com",
-          projectId: "trip-4c948",
-          storageBucket: "trip-4c948.firebasestorage.app",
-          messagingSenderId: "354985320842",
-          appId: "1:354985320842:web:129734ef2750be1181e873",
-          measurementId: "G-TGKTV5F0Y4"
-        };
-        
+        // --- FIREBASE 初始化 (系統環境) ---
+        const firebaseConfig = JSON.parse(__firebase_config);
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
-        
-        const TRIP_ID = 'my-osaka-trip-2026';
-        const getTripDocRef = (docName) => doc(db, 'trips', TRIP_ID, 'data', docName);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
+        let userId = null;
         let isFirebaseReady = false;
+
+        // --- 嚴格的路徑 Helper (規則1) ---
+        const getTripDocRef = (docName) => {
+            if (!userId) {
+                console.error("Attempted to access DB before Auth");
+                return null;
+            }
+            // 使用 private users 集合: /artifacts/{appId}/users/{userId}/trip_data/{docName}
+            return doc(db, 'artifacts', appId, 'users', userId, 'trip_data', docName);
+        };
 
         async function initAuthApp() {
             try {
-                // 直接使用匿名登入
-                await signInAnonymously(auth);
-                
-                // 登入成功後，標記就緒並啟動監聽
-                isFirebaseReady = true;
-                document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
-                document.getElementById('sync-status').style.display = 'flex';
-                document.getElementById('sync-status').style.color = '#1e293b';
-                document.getElementById('sync-status').style.borderColor = '#1e293b';
-                
-                listenToFirebase();
-            } catch (error) {
-                // 自動處理 auth/configuration-not-found 錯誤
-                let errMsg = "📴 離線模式";
-                if (error.code === 'auth/configuration-not-found') {
-                    errMsg = "⚠️ 請至 Console 啟用匿名登入";
-                } else if (error.code === 'auth/unauthorized-domain') {
-                    errMsg = "⚠️ 網域未授權";
-                } else if (error.code === 'auth/api-key-not-valid') {
-                    errMsg = "⚠️ API Key 無效";
+                // 優先使用 Custom Token (規則3)
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
                 } else {
-                    // 其他錯誤，可能是網路問題
-                    errMsg = "📴 連線失敗";
+                    await signInAnonymously(auth);
                 }
                 
-                document.getElementById('sync-status').innerText = errMsg;
+                if (auth.currentUser) {
+                    userId = auth.currentUser.uid;
+                    isFirebaseReady = true;
+                    document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
+                    document.getElementById('sync-status').style.display = 'flex';
+                    document.getElementById('sync-status').style.color = '#1e293b';
+                    document.getElementById('sync-status').style.borderColor = '#1e293b';
+                    
+                    listenToFirebase();
+                }
+            } catch (error) {
+                console.error("Auth Failed:", error);
+                document.getElementById('sync-status').innerText = "⚠️ 連線失敗";
                 document.getElementById('sync-status').style.color = '#e11d48';
-                document.getElementById('sync-status').style.borderColor = '#e11d48';
                 document.getElementById('sync-status').style.display = 'flex';
-                
-                console.warn("Firebase Auth Issue:", error.code);
             }
         }
         
@@ -519,34 +510,36 @@
 
         async function fbSave(docName, data) {
             // 嚴格守衛：未準備好前不執行寫入
-            if (!isFirebaseReady || !auth.currentUser) return;
+            if (!isFirebaseReady || !userId) return;
             
             try {
                 document.getElementById('sync-status').innerText = "☁️ 同步中...";
-                await setDoc(getTripDocRef(docName), data, { merge: true });
-                document.getElementById('sync-status').innerText = "☁️ 已同步";
-                setTimeout(() => {
-                    if(document.getElementById('sync-status').innerText === "☁️ 已同步") {
-                        document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
-                    }
-                }, 2000);
+                const ref = getTripDocRef(docName);
+                if(ref) {
+                    await setDoc(ref, data, { merge: true });
+                    document.getElementById('sync-status').innerText = "☁️ 已同步";
+                    setTimeout(() => {
+                        if(document.getElementById('sync-status').innerText === "☁️ 已同步") {
+                            document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
+                        }
+                    }, 2000);
+                }
             } catch (e) {
                 console.error("Save failed", e);
-                // 如果是因為權限不足，提示使用者
-                if (e.code === 'permission-denied') {
-                    document.getElementById('sync-status').innerText = "❌ 權限不足 (檢查Rules)";
-                    document.getElementById('sync-status').style.color = '#e11d48';
-                }
+                document.getElementById('sync-status').innerText = "❌ 同步錯誤";
             }
         }
 
         function listenToFirebase() {
-            if (!auth.currentUser) return;
+            if (!userId) return;
 
             const collections = ['meta', 'itinerary', 'money', 'moods', 'shopping', 'prep', 'hotels', 'refs', 'rests'];
             
             collections.forEach(key => {
-                onSnapshot(getTripDocRef(key), (docSnap) => {
+                const ref = getTripDocRef(key);
+                if (!ref) return;
+
+                onSnapshot(ref, (docSnap) => {
                     if (docSnap.exists()) {
                         const data = docSnap.data();
                         const localKeyMap = {
@@ -591,8 +584,7 @@
                         }
                     }
                 }, (error) => {
-                    // 忽略初始權限錯誤
-                    if (error.code !== 'permission-denied') console.error("Sync error", error);
+                    console.error("Sync error", error);
                 });
             });
         }
