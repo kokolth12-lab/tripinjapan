@@ -438,8 +438,8 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, disableNetwork, enableNetwork, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
         // --- 全域變數宣告 ---
         const RATE_HKD = 0.051;
@@ -455,91 +455,157 @@
         let pendingRestImg = "";
         let calcInput = "0"; let calcBuffer = 0; let calcPendingOp = null; let calcJustSolved = false; let calcFormula = "";
         
-        // --- FIREBASE 初始化 (系統環境) ---
-        const firebaseConfig = JSON.parse(__firebase_config);
+        // --- 新增：配額狀態旗標 ---
+        let isQuotaExceeded = false;
+        
+        // --- FIREBASE 初始化 (使用您的設定) ---
+        const firebaseConfig = {
+          apiKey: "AIzaSyCMPSoMyRLnE4MBOJTG4A5Yn1Gc3ILQXKM",
+          authDomain: "trip-4c948.firebaseapp.com",
+          projectId: "trip-4c948",
+          storageBucket: "trip-4c948.firebasestorage.app",
+          messagingSenderId: "354985320842",
+          appId: "1:354985320842:web:129734ef2750be1181e873",
+          measurementId: "G-TGKTV5F0Y4"
+        };
+        
+        // 靜音 Firebase 內部 Log 以減少干擾
+        setLogLevel('silent');
+
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        
+        const TRIP_ID = 'my-osaka-trip-2026';
+        const getTripDocRef = (docName) => doc(db, 'trips', TRIP_ID, 'data', docName);
 
-        let userId = null;
         let isFirebaseReady = false;
 
-        // --- 嚴格的路徑 Helper (規則1) ---
-        const getTripDocRef = (docName) => {
-            if (!userId) {
-                console.error("Attempted to access DB before Auth");
-                return null;
+        // Centralized handler for quota limits
+        async function handleQuotaExceeded() {
+            if (isQuotaExceeded) return;
+            isQuotaExceeded = true;
+            localStorage.setItem('firebase-quota-exceeded-time', Date.now()); // 記住這個狀態
+            
+            try {
+                await disableNetwork(db);
+                console.warn("Network disabled due to quota limits.");
+            } catch(e) {
+                console.error("Failed to disable network:", e);
             }
-            // 使用 private users 集合: /artifacts/{appId}/users/{userId}/trip_data/{docName}
-            return doc(db, 'artifacts', appId, 'users', userId, 'trip_data', docName);
-        };
+            document.getElementById('sync-status').innerText = "⚠️ 額度用盡 (僅本地)";
+            document.getElementById('sync-status').style.color = '#e11d48';
+            window.showToast("今日雲端額度已滿，轉為離線模式 📴");
+        }
 
         async function initAuthApp() {
-            try {
-                // 優先使用 Custom Token (規則3)
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else {
-                    await signInAnonymously(auth);
-                }
+            // [關鍵修復] 檢查之前是否已經爆過額度 (12小時內)
+            const quotaExceededTime = localStorage.getItem('firebase-quota-exceeded-time');
+            if (quotaExceededTime && (Date.now() - parseInt(quotaExceededTime)) < 12 * 60 * 60 * 1000) {
+                console.warn("Starting in offline mode due to recent quota exceeded.");
+                isQuotaExceeded = true;
                 
-                if (auth.currentUser) {
-                    userId = auth.currentUser.uid;
-                    isFirebaseReady = true;
-                    document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
-                    document.getElementById('sync-status').style.display = 'flex';
-                    document.getElementById('sync-status').style.color = '#1e293b';
-                    document.getElementById('sync-status').style.borderColor = '#1e293b';
-                    
-                    listenToFirebase();
-                }
-            } catch (error) {
-                console.error("Auth Failed:", error);
-                document.getElementById('sync-status').innerText = "⚠️ 連線失敗";
+                // Force disable network to be sure
+                try { await disableNetwork(db); } catch(e) {}
+                
+                document.getElementById('sync-status').innerText = "⚠️ 額度用盡 (僅本地)";
                 document.getElementById('sync-status').style.color = '#e11d48';
                 document.getElementById('sync-status').style.display = 'flex';
+                
+                // DO NOT call listenToFirebase() here. 
+                // The app has already loaded data from localStorage in window.onload.
+                // Calling listenToFirebase while disabled usually works from cache, 
+                // but if the error is persistent, skipping it is the safest way to silence the console.
+                return; 
+            }
+
+            try {
+                // 直接使用匿名登入
+                await signInAnonymously(auth);
+                
+                // 登入成功後，標記就緒並啟動監聽
+                isFirebaseReady = true;
+                document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
+                document.getElementById('sync-status').style.display = 'flex';
+                document.getElementById('sync-status').style.color = '#1e293b';
+                document.getElementById('sync-status').style.borderColor = '#1e293b';
+                
+                listenToFirebase();
+            } catch (error) {
+                // 自動處理 auth/configuration-not-found 錯誤
+                let errMsg = "📴 離線模式";
+                if (error.code === 'auth/configuration-not-found') {
+                    errMsg = "⚠️ 請至 Console 啟用匿名登入";
+                } else if (error.code === 'auth/unauthorized-domain') {
+                    errMsg = "⚠️ 網域未授權";
+                } else if (error.code === 'auth/api-key-not-valid') {
+                    errMsg = "⚠️ API Key 無效";
+                } else {
+                    // 其他錯誤，可能是網路問題
+                    errMsg = "📴 連線失敗";
+                }
+                
+                document.getElementById('sync-status').innerText = errMsg;
+                document.getElementById('sync-status').style.color = '#e11d48';
+                document.getElementById('sync-status').style.borderColor = '#e11d48';
+                document.getElementById('sync-status').style.display = 'flex';
+                
+                console.warn("Firebase Auth Issue:", error.code);
             }
         }
         
         // 供使用者點擊 retry
-        window.retryAuth = function() {
+        window.retryAuth = async function() {
+            isQuotaExceeded = false; // 重試時重置旗標
+            localStorage.removeItem('firebase-quota-exceeded-time'); // 清除記憶
             document.getElementById('sync-status').innerText = "☁️ 連線中...";
+            try { await enableNetwork(db); } catch(e) { console.warn(e); } // Try to re-enable
             initAuthApp();
         };
 
         async function fbSave(docName, data) {
-            // 嚴格守衛：未準備好前不執行寫入
-            if (!isFirebaseReady || !userId) return;
+            // 嚴格守衛：未準備好、未登入、或配額已滿時不執行
+            if (!isFirebaseReady || !auth.currentUser) return;
+            if (isQuotaExceeded) {
+                // [UX修復] 即使雲端額度滿了，也提示使用者「本地已儲存」，避免以為失敗
+                window.showToast("已儲存至本機 (離線模式) 💾");
+                console.warn("Skipping sync: Quota exceeded");
+                return;
+            }
             
             try {
                 document.getElementById('sync-status').innerText = "☁️ 同步中...";
-                const ref = getTripDocRef(docName);
-                if(ref) {
-                    await setDoc(ref, data, { merge: true });
-                    document.getElementById('sync-status').innerText = "☁️ 已同步";
-                    setTimeout(() => {
-                        if(document.getElementById('sync-status').innerText === "☁️ 已同步") {
-                            document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
-                        }
-                    }, 2000);
-                }
+                await setDoc(getTripDocRef(docName), data, { merge: true });
+                document.getElementById('sync-status').innerText = "☁️ 已同步";
+                setTimeout(() => {
+                    if(document.getElementById('sync-status').innerText === "☁️ 已同步") {
+                        document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
+                    }
+                }, 2000);
             } catch (e) {
                 console.error("Save failed", e);
-                document.getElementById('sync-status').innerText = "❌ 同步錯誤";
+                // 如果是因為權限不足，提示使用者
+                if (e.code === 'permission-denied') {
+                    document.getElementById('sync-status').innerText = "❌ 權限不足 (檢查Rules)";
+                    document.getElementById('sync-status').style.color = '#e11d48';
+                }
+                // [修復] 偵測配額用盡錯誤
+                if (e.code === 'resource-exhausted') {
+                    await handleQuotaExceeded();
+                }
             }
         }
 
         function listenToFirebase() {
-            if (!userId) return;
+            if (!auth.currentUser) return;
 
             const collections = ['meta', 'itinerary', 'money', 'moods', 'shopping', 'prep', 'hotels', 'refs', 'rests'];
             
             collections.forEach(key => {
-                const ref = getTripDocRef(key);
-                if (!ref) return;
+                onSnapshot(getTripDocRef(key), (docSnap) => {
+                     // [效能修復] 忽略本地寫入的「即時回傳」，避免打斷使用者編輯或造成畫面閃爍
+                    if (docSnap.metadata.hasPendingWrites) return;
 
-                onSnapshot(ref, (docSnap) => {
                     if (docSnap.exists()) {
                         const data = docSnap.data();
                         const localKeyMap = {
@@ -578,13 +644,20 @@
                                 }
                                 if (key === 'refs') {
                                      const c = document.getElementById('ref-cards-container'); if(c) c.innerHTML = ""; 
-                                     data.val.forEach(r => window.addNewRefCard(r));
+                                     data.val.forEach(r => window.addNewRefCard(r, false));
                                 }
                             }
                         }
                     }
                 }, (error) => {
-                    console.error("Sync error", error);
+                    // [修復] 在監聽器中也偵測配額用盡錯誤
+                    if (error.code === 'resource-exhausted') {
+                        handleQuotaExceeded();
+                        return;
+                    }
+                    
+                    // 忽略初始權限錯誤
+                    if (error.code !== 'permission-denied') console.error("Sync error", error);
                 });
             });
         }
@@ -737,7 +810,24 @@
             window.loadPrep(); i.value = ""; 
             fbSave('prep', { val: s });
         };
-        window.loadPrep = function() { const s = JSON.parse(localStorage.getItem('trip-prep-v1') || '[]'); document.getElementById('prep-list-ticket').innerHTML = ""; document.getElementById('prep-list-luggage').innerHTML = ""; s.forEach(i => { const l = document.getElementById(`prep-list-${i.category}`); const div = document.createElement('div'); div.className = `p-2 bg-white rounded-xl flex items-center gap-3 border-2 border-slate-200 ${i.checked ? 'opacity-30' : ''}`; div.innerHTML = `<div class="w-6 h-6 border-2 border-slate-800 rounded flex items-center justify-center cursor-pointer ${i.checked ? 'bg-indigo-400 text-white' : ''}" onclick="window.togglePrepItem(${i.id})">${i.checked ? '✓' : ''}</div><div class="flex-1 font-bold text-[11px]">${i.text}</div><div class="text-slate-300 cursor-pointer" onclick="window.delPrepItem(${i.id})">✕</div>`; l.appendChild(div); }); }
+        window.loadPrep = function() { 
+            const s = JSON.parse(localStorage.getItem('trip-prep-v1') || '[]'); 
+            const listTicket = document.getElementById('prep-list-ticket');
+            const listLuggage = document.getElementById('prep-list-luggage'); // [修復] ID已更正
+            
+            if(listTicket) listTicket.innerHTML = "";
+            if(listLuggage) listLuggage.innerHTML = "";
+            
+            s.forEach(i => { 
+                const l = document.getElementById(`prep-list-${i.category}`); 
+                if(l) {
+                    const div = document.createElement('div'); 
+                    div.className = `p-2 bg-white rounded-xl flex items-center gap-3 border-2 border-slate-200 ${i.checked ? 'opacity-30' : ''}`; 
+                    div.innerHTML = `<div class="w-6 h-6 border-2 border-slate-800 rounded flex items-center justify-center cursor-pointer ${i.checked ? 'bg-indigo-400 text-white' : ''}" onclick="window.togglePrepItem(${i.id})">${i.checked ? '✓' : ''}</div><div class="flex-1 font-bold text-[11px]">${i.text}</div><div class="text-slate-300 cursor-pointer" onclick="window.delPrepItem(${i.id})">✕</div>`; 
+                    l.appendChild(div); 
+                }
+            }); 
+        }
         window.togglePrepItem = function(id) { 
             let s = JSON.parse(localStorage.getItem('trip-prep-v1') || '[]'); const idx = s.findIndex(i => i.id === id); s[idx].checked = !s[idx].checked; localStorage.setItem('trip-prep-v1', JSON.stringify(s)); 
             window.loadPrep(); 
@@ -748,14 +838,18 @@
             window.loadPrep(); 
             fbSave('prep', { val: s });
         };
-        window.addNewRefCard = function(d = { title: "新筆記", content: "內容..." }) { 
+        
+        // --- 核心修復部分：增加 save 參數 ---
+        window.addNewRefCard = function(d = { title: "新筆記", content: "內容..." }, save = true) { 
             const c = document.getElementById('ref-cards-container'); 
             const div = document.createElement('div'); 
             div.className = 'ref-card btn-style'; 
             div.innerHTML = `<div class="flex justify-between border-b-2 border-dashed border-slate-300 pb-2"><div class="text-slate-800 font-black outline-none" contenteditable="true" onblur="window.saveRefCards()">${d.title}</div><div class="cursor-pointer text-slate-300 font-bold" onclick="this.closest('.ref-card').remove(); window.saveRefCards();">✕</div></div><div class="text-slate-500 text-xs outline-none min-h-[100px] leading-relaxed pt-2" contenteditable="true" onblur="window.saveRefCards()">${d.content}</div>`; 
             c.appendChild(div); 
-            window.saveRefCards(); 
+            // 只有當 save 為 true 時才執行存檔，防止無限迴圈
+            if (save) window.saveRefCards(); 
         };
+        
         window.saveRefCards = function() { 
             const cards = []; document.querySelectorAll('#ref-cards-container > .ref-card').forEach(el => { cards.push({ title: el.children[0].children[0].innerText, content: el.children[1].innerText }); }); 
             localStorage.setItem('trip-ref-cards-v1', JSON.stringify(cards)); 
@@ -769,7 +863,15 @@
             ['main-trip-title', 'main-trip-date', 'flight-out-no', 'flight-out-time', 'flight-out-price', 'flight-in-no', 'flight-in-time', 'flight-in-price'].forEach(id => { const s = localStorage.getItem(id); if (s) document.getElementById(id).innerText = s; });
             const savedItinerary = localStorage.getItem('trip-itinerary-v17'); if (savedItinerary) window.itineraryData = JSON.parse(savedItinerary);
             const savedHotels = localStorage.getItem('trip-hotels-v4'); if (savedHotels) JSON.parse(savedHotels).forEach(h => window.addNewHotel(h)); else window.addNewHotel();
-            const savedRefs = localStorage.getItem('trip-ref-cards-v1'); if (savedRefs) JSON.parse(savedRefs).forEach(r => window.addNewRefCard(r)); else window.addNewRefCard({title:"住宿備註範本", content:"飯店位置、預訂號碼..."});
+            
+            // [修復] 初始化讀取時，不要觸發存檔 (傳入 false)
+            const savedRefs = localStorage.getItem('trip-ref-cards-v1'); 
+            if (savedRefs) {
+                JSON.parse(savedRefs).forEach(r => window.addNewRefCard(r, false)); 
+            } else {
+                window.addNewRefCard({title:"住宿備註範本", content:"飯店位置、預訂號碼..."}, false);
+            }
+            
             window.initDayTabs(); window.loadMExpenses(); window.loadMoodEntries(); window.loadRestEntries(); window.loadShopping(); window.loadPrep(); window.updateSummaryDisplay();
             
             // 啟動 Firebase
