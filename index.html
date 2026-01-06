@@ -164,23 +164,25 @@
 
         @keyframes popIn { from { opacity: 0; transform: scale(0.93); } to { opacity: 1; transform: scale(1); } }
         
-        /* 🔥 Firebase 狀態 */
+        /* 🔥 Firebase 狀態指示器 (針對發布後診斷) */
         #sync-status {
             position: fixed; top: 10px; right: 10px;
             background: rgba(255, 255, 255, 0.95);
-            padding: 6px 14px; border-radius: 20px;
-            font-size: 0.7rem; font-weight: 900;
-            color: var(--magic-blue); border: 2px solid var(--dark-border);
+            padding: 8px 16px; border-radius: 20px;
+            font-size: 0.75rem; font-weight: 900;
+            color: var(--magic-blue); border: 3px solid var(--dark-border);
             z-index: 9000; display: none;
-            align-items: center; gap: 6px; box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            align-items: center; gap: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            cursor: pointer;
         }
+        #sync-status:hover { transform: scale(1.05); }
     </style>
 </head>
 <body oncontextmenu="return false;">
 
     <div id="loading-screen"><div class="loading-plane">✈️</div><div class="mt-4 font-black text-slate-400 tracking-[0.4em] text-[10px] uppercase">Journey is Loading...</div></div>
     
-    <div id="sync-status">☁️ 連線中...</div>
+    <div id="sync-status" onclick="window.retryAuth()">☁️ 連線中...</div>
 
     <!-- 🧮 懸浮計算機 -->
     <div id="floating-calc-btn" onclick="window.toggleCalc()">🧮</div>
@@ -483,26 +485,37 @@
                 document.getElementById('sync-status').innerText = "☁️ 雲端已連線";
                 document.getElementById('sync-status').style.display = 'flex';
                 document.getElementById('sync-status').style.color = '#1e293b';
+                document.getElementById('sync-status').style.borderColor = '#1e293b';
                 
                 listenToFirebase();
             } catch (error) {
                 // 自動處理 auth/configuration-not-found 錯誤
+                let errMsg = "📴 離線模式";
                 if (error.code === 'auth/configuration-not-found') {
-                    // console.warn("Firebase Auth Error: 尚未啟用匿名登入");
-                    document.getElementById('sync-status').innerText = "⚠️ 請至 Console 啟用匿名登入";
-                    document.getElementById('sync-status').style.color = '#e11d48';
+                    errMsg = "⚠️ 請至 Console 啟用匿名登入";
                 } else if (error.code === 'auth/unauthorized-domain') {
-                    document.getElementById('sync-status').innerText = "⚠️ 網域未授權";
-                    document.getElementById('sync-status').style.color = '#e11d48';
+                    errMsg = "⚠️ 網域未授權";
+                } else if (error.code === 'auth/api-key-not-valid') {
+                    errMsg = "⚠️ API Key 無效";
                 } else {
-                    console.error("Auth Failed", error);
-                    document.getElementById('sync-status').innerText = "📴 離線模式";
+                    // 其他錯誤，可能是網路問題
+                    errMsg = "📴 連線失敗";
                 }
                 
+                document.getElementById('sync-status').innerText = errMsg;
+                document.getElementById('sync-status').style.color = '#e11d48';
+                document.getElementById('sync-status').style.borderColor = '#e11d48';
                 document.getElementById('sync-status').style.display = 'flex';
-                // 雖然連線失敗，但我們不阻擋使用者使用 App (使用 localStorage)
+                
+                console.warn("Firebase Auth Issue:", error.code);
             }
         }
+        
+        // 供使用者點擊 retry
+        window.retryAuth = function() {
+            document.getElementById('sync-status').innerText = "☁️ 連線中...";
+            initAuthApp();
+        };
 
         async function fbSave(docName, data) {
             // 嚴格守衛：未準備好前不執行寫入
@@ -519,7 +532,11 @@
                 }, 2000);
             } catch (e) {
                 console.error("Save failed", e);
-                // 靜默失敗，不影響使用者操作
+                // 如果是因為權限不足，提示使用者
+                if (e.code === 'permission-denied') {
+                    document.getElementById('sync-status').innerText = "❌ 權限不足 (檢查Rules)";
+                    document.getElementById('sync-status').style.color = '#e11d48';
+                }
             }
         }
 
@@ -574,7 +591,7 @@
                         }
                     }
                 }, (error) => {
-                    // 忽略初始權限錯誤，通常是因為 Auth 尚未完成
+                    // 忽略初始權限錯誤
                     if (error.code !== 'permission-denied') console.error("Sync error", error);
                 });
             });
@@ -739,7 +756,14 @@
             window.loadPrep(); 
             fbSave('prep', { val: s });
         };
-        window.addNewRefCard = function(d = { title: "新筆記", content: "內容..." }) { const c = document.getElementById('ref-cards-container'); const div = document.createElement('div'); div.className = 'ref-card btn-style'; div.innerHTML = `<div class="flex justify-between border-b-2 border-dashed border-slate-300 pb-2"><div class="text-slate-800 font-black outline-none" contenteditable="true">${d.title}</div><div class="cursor-pointer text-slate-300 font-bold" onclick="this.closest('.ref-card').remove(); window.saveRefCards();">✕</div></div><div class="text-slate-500 text-xs outline-none min-h-[100px] leading-relaxed pt-2" contenteditable="true">${d.content}</div>`; c.appendChild(div); window.saveRefCards(); };
+        window.addNewRefCard = function(d = { title: "新筆記", content: "內容..." }) { 
+            const c = document.getElementById('ref-cards-container'); 
+            const div = document.createElement('div'); 
+            div.className = 'ref-card btn-style'; 
+            div.innerHTML = `<div class="flex justify-between border-b-2 border-dashed border-slate-300 pb-2"><div class="text-slate-800 font-black outline-none" contenteditable="true" onblur="window.saveRefCards()">${d.title}</div><div class="cursor-pointer text-slate-300 font-bold" onclick="this.closest('.ref-card').remove(); window.saveRefCards();">✕</div></div><div class="text-slate-500 text-xs outline-none min-h-[100px] leading-relaxed pt-2" contenteditable="true" onblur="window.saveRefCards()">${d.content}</div>`; 
+            c.appendChild(div); 
+            window.saveRefCards(); 
+        };
         window.saveRefCards = function() { 
             const cards = []; document.querySelectorAll('#ref-cards-container > .ref-card').forEach(el => { cards.push({ title: el.children[0].children[0].innerText, content: el.children[1].innerText }); }); 
             localStorage.setItem('trip-ref-cards-v1', JSON.stringify(cards)); 
